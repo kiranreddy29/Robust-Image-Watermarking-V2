@@ -74,9 +74,16 @@ def main():
 
     # Load Model
     G = WatermarkGenerator().to(device)
-    checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
-    G.load_state_dict(checkpoint['G'])
-    print(f"Loaded weights from {CHECKPOINT_PATH}")
+    try:
+        ckpt = torch.load(CHECKPOINT_PATH, map_location=device)
+        if isinstance(ckpt, dict) and "G" in ckpt:
+            G.load_state_dict(ckpt["G"])
+        else:
+            G.load_state_dict(ckpt)
+        print(f"Loaded weights from {CHECKPOINT_PATH}")
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        return
 
     # Load Data
     cover_loader = get_loader(DATA_COVER, batch_size=BATCH_SIZE, shuffle=False)

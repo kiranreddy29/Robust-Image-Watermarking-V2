@@ -9,7 +9,7 @@ _INPUT_RES  = (224, 224)
 
 
 class TextureSaliency(nn.Module):
-    """Used as INFORMATIONAL FEATURE only, NOT as a multiplier."""
+    """Core Patent Feature: Sobel-guided Visual Masking"""
     def __init__(self):
         super().__init__()
         kernel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]).view(1, 1, 3, 3).repeat(3, 1, 1, 1)
@@ -22,12 +22,13 @@ class TextureSaliency(nn.Module):
             grad_x = F.conv2d(x, self.weight_x, padding=1, groups=3)
             grad_y = F.conv2d(x, self.weight_y, padding=1, groups=3)
             magnitude = torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1e-6)
+            
             mask = magnitude.mean(dim=1, keepdim=True)
             min_val = mask.amin(dim=(2, 3), keepdim=True)
             max_val = mask.amax(dim=(2, 3), keepdim=True)
+            
             norm_mask = (mask - min_val) / (max_val - min_val + 1e-8)
-            # Range [0, 1] — used as feature, NOT multiplier
-            return norm_mask
+            return norm_mask * 0.5 + 0.5
 
 
 class InvertibleBlock(nn.Module):
@@ -151,16 +152,26 @@ class DifferentialFeatureExtractor(nn.Module):
 class WatermarkGenerator(nn.Module):
     def __init__(self, num_blocks=8):
         super().__init__()
+        
+        # 1. Initialize your unique saliency feature
+        self.saliency     = TextureSaliency() 
+        
         self.isn_blocks   = nn.ModuleList([InvertibleBlock(in_channels=6) for _ in range(num_blocks)])
         self.enhance_pre  = EnhancementModule(channels=3, window_size=4)
         self.enhance_post = EnhancementModule(channels=3, window_size=8)
         self.diff_feat    = DifferentialFeatureExtractor(channels=3)
 
     def embed(self, cover, secret):
-        """Embeds secret into cover via invertible flow."""
-        x = torch.cat([cover, secret], dim=1)
+        """Embeds secret into cover via invertible flow with Saliency Modulation."""
+        
+        # 2. Modulate the secret using the cover's texture mask
+        mask = self.saliency(cover).detach()
+        modulated_secret = secret * mask 
+        
+        x = torch.cat([cover, modulated_secret], dim=1)
         for block in self.isn_blocks:
             x = block(x, reverse=False)
+            
         watermarked = x[:, :3, :, :]
         z = x[:, 3:, :, :]   # latent (residual)
         return torch.clamp(watermarked, -1.0, 1.0), z
@@ -169,10 +180,18 @@ class WatermarkGenerator(nn.Module):
         xc_feat     = self.diff_feat(watermarked, attacked)
         xd_enhanced = self.enhance_pre(attacked)
         x = torch.cat([xd_enhanced, xc_feat], dim=1)
+        
         for block in reversed(self.isn_blocks):
             x = block(x, reverse=True)
+            
         raw_secret = x[:, 3:, :, :]
-        return torch.clamp(self.enhance_post(raw_secret), -1.0, 1.0)
+        
+        # 3. EXACT DEMODULATION
+        # Recompute the mask from the watermarked image to perfectly reverse the modulation
+        mask = self.saliency(watermarked).detach()
+        demodulated_secret = raw_secret / mask
+        
+        return torch.clamp(self.enhance_post(demodulated_secret), -1.0, 1.0)
 
     def forward(self, cover, secret):
         """For training: returns (watermarked, z)."""
