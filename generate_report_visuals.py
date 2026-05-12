@@ -32,7 +32,13 @@ def main():
     
     G = WatermarkGenerator().to(device)
     try:
-        G.load_state_dict(torch.load(WEIGHTS_PATH, map_location=device))
+        ckpt = torch.load(WEIGHTS_PATH, map_location=device)
+        # Check if it's a checkpoint dict or raw state_dict
+        if isinstance(ckpt, dict) and "G" in ckpt:
+            G.load_state_dict(ckpt["G"])
+        else:
+            G.load_state_dict(ckpt)
+            
         G.eval()
         print(f"Successfully loaded weights from {WEIGHTS_PATH}!")
     except Exception as e:

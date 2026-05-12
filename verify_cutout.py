@@ -31,7 +31,13 @@ def main():
     G = WatermarkGenerator().to(device)
     
     try:
-        G.load_state_dict(torch.load(WEIGHTS_PATH, map_location=device))
+        ckpt = torch.load(WEIGHTS_PATH, map_location=device)
+        # Check if it's a checkpoint dict or raw state_dict
+        if isinstance(ckpt, dict) and "G" in ckpt:
+            G.load_state_dict(ckpt["G"])
+        else:
+            G.load_state_dict(ckpt)
+            
         G.eval()
         print(f"Successfully loaded {WEIGHTS_PATH}")
     except Exception as e:
@@ -53,7 +59,7 @@ def main():
 
     # Embed the Secret
     with torch.no_grad():
-        watermarked = G.embed(cover_img, secret_img)
+        watermarked, _ = G.embed(cover_img, secret_img)
         
         # MANUALLY APPLY THE CUTOUT ATTACK (Drop 15% of data)
         attacker = CutoutAttack(drop_prob=0.15, block_size=48).to(device)

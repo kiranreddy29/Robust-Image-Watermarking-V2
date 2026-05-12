@@ -19,8 +19,19 @@ def main():
         print("Model not found. Run training first.")
         return
 
-    G.load_state_dict(torch.load(model_path, map_location=device))
-    G.eval()
+    try:
+        ckpt = torch.load(model_path, map_location=device)
+        # Handle both raw state_dicts and training checkpoint dictionaries
+        if isinstance(ckpt, dict) and "G" in ckpt:
+            G.load_state_dict(ckpt["G"])
+        else:
+            G.load_state_dict(ckpt)
+            
+        G.eval()
+        print(f"Successfully loaded {model_path}")
+    except Exception as e:
+        print(f"Error loading model weights: {e}")
+        return
 
     cover_loader = get_loader("data/DIV2K/cover", batch_size=1)
     wm_loader    = get_loader("data/DIV2K/watermark", batch_size=1)

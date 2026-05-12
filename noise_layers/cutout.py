@@ -14,13 +14,11 @@ class CutoutAttack(nn.Module):
         num_blocks = int((h * w * self.drop_prob) / (self.block_size ** 2))
 
         if num_blocks > 0:
-            y_starts = torch.randint(0, h - self.block_size + 1, (b, num_blocks), device=image.device)
-            x_starts = torch.randint(0, w - self.block_size + 1, (b, num_blocks), device=image.device)
-            b_idx = torch.arange(b, device=image.device).unsqueeze(1).expand(-1, num_blocks)
+            for k in range(num_blocks):
+                y = torch.randint(0, h - self.block_size + 1, (b,), device=image.device)
+                x = torch.randint(0, w - self.block_size + 1, (b,), device=image.device)
+                for bi in range(b):
+                    # Optimized tensor slicing instead of double for-loops
+                    mask[bi, 0, y[bi]:y[bi]+self.block_size, x[bi]:x[bi]+self.block_size] = 0.0
 
-            for i in range(self.block_size):
-                for j in range(self.block_size):
-                    mask[b_idx, 0, y_starts + i, x_starts + j] = 0.0
-
-        noised_image = image * mask
-        return [noised_image, noised_and_cover[1]]
+        return [image * mask, noised_and_cover[1]]
