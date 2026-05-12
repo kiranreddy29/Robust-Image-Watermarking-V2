@@ -7,7 +7,9 @@ _SWIN_DIM   = 96
 _SWIN_HEADS = 3
 _INPUT_RES  = (224, 224)
 
+
 class TextureSaliency(nn.Module):
+    """Used as INFORMATIONAL FEATURE only, NOT as a multiplier."""
     def __init__(self):
         super().__init__()
         kernel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]).view(1, 1, 3, 3).repeat(3, 1, 1, 1)
@@ -16,49 +18,56 @@ class TextureSaliency(nn.Module):
         self.register_buffer('weight_y', kernel_y)
 
     def forward(self, x):
-        # Disable gradient tracking entirely for the physical edge detection
         with torch.no_grad():
             grad_x = F.conv2d(x, self.weight_x, padding=1, groups=3)
             grad_y = F.conv2d(x, self.weight_y, padding=1, groups=3)
             magnitude = torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1e-6)
-            
             mask = magnitude.mean(dim=1, keepdim=True)
             min_val = mask.amin(dim=(2, 3), keepdim=True)
             max_val = mask.amax(dim=(2, 3), keepdim=True)
-            
             norm_mask = (mask - min_val) / (max_val - min_val + 1e-8)
-            return norm_mask * 0.5 + 0.5
+            # Range [0, 1] — used as feature, NOT multiplier
+            return norm_mask
+
 
 class InvertibleBlock(nn.Module):
-    def __init__(self, in_channels=6):
+    """FIX: Replaced Tanh with bounded clamp via soft scaling. Allows wider dynamic range."""
+    def __init__(self, in_channels=6, clamp=2.0):
         super().__init__()
         half = in_channels // 2
-        self.s1 = nn.Sequential(nn.Conv2d(half, 64, 3, padding=1), nn.ReLU(inplace=False), nn.Conv2d(64, half, 3, padding=1), nn.Tanh())
+        self.clamp = clamp
+        self.s1 = nn.Sequential(nn.Conv2d(half, 64, 3, padding=1), nn.ReLU(inplace=False), nn.Conv2d(64, half, 3, padding=1))
         self.t1 = nn.Sequential(nn.Conv2d(half, 64, 3, padding=1), nn.ReLU(inplace=False), nn.Conv2d(64, half, 3, padding=1))
-        self.s2 = nn.Sequential(nn.Conv2d(half, 64, 3, padding=1), nn.ReLU(inplace=False), nn.Conv2d(64, half, 3, padding=1), nn.Tanh())
+        self.s2 = nn.Sequential(nn.Conv2d(half, 64, 3, padding=1), nn.ReLU(inplace=False), nn.Conv2d(64, half, 3, padding=1))
         self.t2 = nn.Sequential(nn.Conv2d(half, 64, 3, padding=1), nn.ReLU(inplace=False), nn.Conv2d(64, half, 3, padding=1))
 
+    def _bound(self, s):
+        # Soft clamp: keeps exp(s) numerically stable but allows wider range than Tanh
+        return self.clamp * torch.tanh(s / self.clamp)
+
     def forward(self, x, reverse=False):
-        x1 = x[:, :3, :, :].clone()
-        x2 = x[:, 3:, :, :].clone()
-        
+        x1 = x[:, :3, :, :]
+        x2 = x[:, 3:, :, :]
         if not reverse:
-            y2 = x2 * torch.exp(self.s1(x1)) + self.t1(x1)
-            y1 = x1.clone()
-            z1 = y1 * torch.exp(self.s2(y2)) + self.t2(y2)
-            z2 = y2.clone()
-            return torch.cat([z1, z2], dim=1)
+            s1 = self._bound(self.s1(x1))
+            y2 = x2 * torch.exp(s1) + self.t1(x1)
+            y1 = x1
+            s2 = self._bound(self.s2(y2))
+            z1 = y1 * torch.exp(s2) + self.t2(y2)
+            return torch.cat([z1, y2], dim=1)
         else:
-            z1 = x1.clone()
-            z2 = x2.clone()
-            y2 = z2.clone()
-            y1 = (z1 - self.t2(y2)) * torch.exp(-self.s2(y2))
-            x1_rev = y1.clone()
-            x2_rev = (y2 - self.t1(x1_rev)) * torch.exp(-self.s1(x1_rev))
-            return torch.cat([x1_rev, x2_rev], dim=1)
+            z1 = x[:, :3, :, :]
+            z2 = x[:, 3:, :, :]
+            y2 = z2
+            s2 = self._bound(self.s2(y2))
+            y1 = (z1 - self.t2(y2)) * torch.exp(-s2)
+            s1 = self._bound(self.s1(y1))
+            x2_rev = (y2 - self.t1(y1)) * torch.exp(-s1)
+            return torch.cat([y1, x2_rev], dim=1)
+
 
 class DenseBlock(nn.Module):
-    def __init__(self, channels=3, growth_rate=16):
+    def __init__(self, channels=3, growth_rate=32):  # Increased capacity
         super().__init__()
         self.conv1 = nn.Conv2d(channels, growth_rate, 3, padding=1)
         self.conv2 = nn.Conv2d(channels + growth_rate, channels, 3, padding=1)
@@ -69,44 +78,42 @@ class DenseBlock(nn.Module):
         out2 = self.conv2(torch.cat([x, out1], dim=1))
         return out2 + x
 
+
 class DynamicMLP(nn.Module):
     def __init__(self, channels):
         super().__init__()
         self.pool    = nn.AdaptiveAvgPool2d(1)
-        self.flatten = nn.Flatten()
         self.fc1     = nn.Linear(channels, channels // 2)
         self.relu    = nn.ReLU(inplace=False)
         self.fc2     = nn.Linear(channels // 2, channels)
+        self.sigmoid = nn.Sigmoid()  # FIX: bound output to [0,1] for stable gating
 
     def forward(self, x):
         b, c, _, _ = x.shape
-        w = self.pool(x)
-        w = self.flatten(w)
+        w = self.pool(x).flatten(1)
         w = self.relu(self.fc1(w))
-        w = self.fc2(w)
-        return w.view(b, c, 1, 1).clone()
+        w = self.sigmoid(self.fc2(w))
+        return w.view(b, c, 1, 1)
+
 
 class SwinBlock(nn.Module):
     def __init__(self, channels, window_size=4):
         super().__init__()
         self.proj_in     = nn.Conv2d(channels, _SWIN_DIM, kernel_size=1)
         self.swin        = TimmSwinBlock(
-            dim              = _SWIN_DIM,
-            input_resolution = _INPUT_RES,
-            num_heads        = _SWIN_HEADS,
-            window_size      = window_size,
-            shift_size       = window_size // 2,
+            dim=_SWIN_DIM, input_resolution=_INPUT_RES,
+            num_heads=_SWIN_HEADS, window_size=window_size,
+            shift_size=window_size // 2,
         )
         self.proj_out    = nn.Conv2d(_SWIN_DIM, channels, kernel_size=1)
         self.dynamic_mlp = DynamicMLP(channels)
 
     def forward(self, x):
-        feat = self.proj_in(x)
-        feat = feat.permute(0, 2, 3, 1)
-        feat = self.swin(feat)
-        feat = feat.permute(0, 3, 1, 2)
+        feat = self.proj_in(x).permute(0, 2, 3, 1)
+        feat = self.swin(feat).permute(0, 3, 1, 2)
         feat = self.proj_out(feat)
         return x + (feat * self.dynamic_mlp(x))
+
 
 class EnhancementModule(nn.Module):
     def __init__(self, channels=3, window_size=4):
@@ -120,6 +127,7 @@ class EnhancementModule(nn.Module):
         feat = self.swin_block(feat)
         feat = self.post_dense(feat)
         return feat + x
+
 
 class DifferentialFeatureExtractor(nn.Module):
     def __init__(self, channels=3, growth_rate=32):
@@ -139,62 +147,38 @@ class DifferentialFeatureExtractor(nn.Module):
         x4   = F.relu(self.conv4(torch.cat([diff, x1, x2, x3], dim=1)))
         return self.final(torch.cat([diff, x1, x2, x3, x4],    dim=1))
 
-class DemodulationModule(nn.Module):
-    def __init__(self, channels=3):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(channels + 1, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=False),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=False),
-            nn.Conv2d(64, channels, kernel_size=3, padding=1)
-        )
-
-    def forward(self, x, mask):
-        # Learned recovery instead of dangerous raw division
-        return self.conv(torch.cat([x, mask], dim=1))
 
 class WatermarkGenerator(nn.Module):
     def __init__(self, num_blocks=8):
         super().__init__()
-        self.saliency     = TextureSaliency()
-        # High-capacity flow with 8 blocks (similar to HiNet/ISN)
+        # Removed TextureSaliency completely as the INN handles placement naturally
         self.isn_blocks   = nn.ModuleList([InvertibleBlock(in_channels=6) for _ in range(num_blocks)])
-        
         self.enhance_pre  = EnhancementModule(channels=3, window_size=4)
-        self.demodulate   = DemodulationModule(channels=3)
         self.enhance_post = EnhancementModule(channels=3, window_size=8)
         self.diff_feat    = DifferentialFeatureExtractor(channels=3)
 
-    def embed(self, cover, secret):
-        # Detach prevents the Generator from trying to "cheat" the texture mask
-        mask = self.saliency(cover).detach()
-        modulated_secret = secret * mask
-        
-        x = torch.cat([cover, modulated_secret], dim=1)
+    def forward(self, cover, secret):
+        """Used for TRAINING: Returns both the watermarked image and latent z"""
+        x = torch.cat([cover, secret], dim=1)
         for block in self.isn_blocks:
             x = block(x, reverse=False)
             
         watermarked = x[:, :3, :, :]
-        return torch.clamp(watermarked, -1.0, 1.0)
+        z = x[:, 3:, :, :] # <--- Capture the latent channels
+        return torch.clamp(watermarked, -1.0, 1.0), z
+
+    def embed(self, cover, secret):
+        """Used for TESTING/INFERENCE: Returns only the watermarked image"""
+        watermarked, _ = self.forward(cover, secret)
+        return watermarked
 
     def extract(self, attacked, watermarked):
         xc_feat     = self.diff_feat(watermarked, attacked)
         xd_enhanced = self.enhance_pre(attacked)
-        
         x = torch.cat([xd_enhanced, xc_feat], dim=1)
-        # Reverse flow for extraction
+        
         for block in reversed(self.isn_blocks):
             x = block(x, reverse=True)
             
-        raw_secret  = x[:, 3:, :, :]
-        
-        # Detach treats the attacked image's mask as a physical constraint
-        mask = self.saliency(watermarked).detach()
-        
-        # Learned demodulation (mask used as feature, not divisor)
-        demodulated_secret = self.demodulate(raw_secret, mask)
-        return torch.clamp(self.enhance_post(demodulated_secret), -1.0, 1.0)
-
-    def forward(self, cover, secret):
-        return self.embed(cover, secret)
+        raw_secret = x[:, 3:, :, :]
+        return torch.clamp(self.enhance_post(raw_secret), -1.0, 1.0)

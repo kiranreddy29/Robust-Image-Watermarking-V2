@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import lpips
+import random
 
 from torch.optim.lr_scheduler import MultiStepLR
 from torch.amp import autocast, GradScaler
@@ -20,57 +21,34 @@ from noise_layers.jpeg_compression import JpegCompression
 from noise_layers.quantization import Quantization
 from utils.dataset import get_loader
 
-# -------------------------------------------------
-# SAFE + FAST SETTINGS FOR KAGGLE T4 x2
-# -------------------------------------------------
 torch.autograd.set_detect_anomaly(False)
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 
-# -------------------------------------------------
-# DWT LOSS
-# -------------------------------------------------
 def haar_dwt2d(x):
-    x00 = x[:, :, 0::2, 0::2]
-    x10 = x[:, :, 1::2, 0::2]
-    x01 = x[:, :, 0::2, 1::2]
-    x11 = x[:, :, 1::2, 1::2]
-
+    x00 = x[:, :, 0::2, 0::2]; x10 = x[:, :, 1::2, 0::2]
+    x01 = x[:, :, 0::2, 1::2]; x11 = x[:, :, 1::2, 1::2]
     ll = (x00 + x10 + x01 + x11) / 2.0
     lh = (x00 - x10 + x01 - x11) / 2.0
     hl = (x00 + x10 - x01 - x11) / 2.0
     hh = (x00 - x10 - x01 + x11) / 2.0
-
     return ll, lh, hl, hh
 
 
 def dwt_loss(x, y):
+    """FIX: Emphasize low-freq (visible) more, ignore high-freq mismatch."""
     llx, lhx, hlx, hhx = haar_dwt2d(x)
     lly, lhy, hly, hhy = haar_dwt2d(y)
-
-    return (
-        F.mse_loss(llx, lly)
-        + 0.5 * (
-            F.mse_loss(lhx, lhy)
-            + F.mse_loss(hlx, hly)
-            + F.mse_loss(hhx, hhy)
-        )
-    )
+    return (F.l1_loss(llx, lly)
+            + 0.1 * (F.l1_loss(lhx, lhy) + F.l1_loss(hlx, hly) + F.l1_loss(hhx, hhy)))
 
 
-# -------------------------------------------------
-# SAFE LOSSES
-# -------------------------------------------------
 def discriminator_loss(real, fake):
     real = torch.clamp(real, 1e-6, 1 - 1e-6)
     fake = torch.clamp(fake, 1e-6, 1 - 1e-6)
-
-    return -(
-        torch.mean(torch.log(real)) +
-        torch.mean(torch.log(1.0 - fake))
-    )
+    return -(torch.mean(torch.log(real)) + torch.mean(torch.log(1.0 - fake)))
 
 
 def generator_adv_loss(fake):
@@ -81,170 +59,122 @@ def generator_adv_loss(fake):
 def safe_lpips(loss_fn, a, b, device):
     try:
         val = loss_fn(a.float(), b.float()).mean()
-
         if torch.isnan(val) or torch.isinf(val):
             return torch.tensor(0.0, device=device)
-
         return val
-    except:
+    except Exception:
         return torch.tensor(0.0, device=device)
 
 
-# -------------------------------------------------
-# MAIN
-# -------------------------------------------------
 def main():
-
     parser = argparse.ArgumentParser()
-
-    parser.add_argument('--epochs', type=int, default=160)
+    parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--phase2_epoch', type=int, default=45)
-    parser.add_argument('--phase3_epoch', type=int, default=130)
-
-    parser.add_argument('--lr_early', type=float, default=10**-4.5)
-    parser.add_argument('--lr_late', type=float, default=10**-5.5)
-
+    parser.add_argument('--phase1_epoch', type=int, default=30)   # NEW: clean training
+    parser.add_argument('--phase2_epoch', type=int, default=80)   # adversarial
+    parser.add_argument('--phase3_epoch', type=int, default=160)  # LR drop
+    parser.add_argument('--lr_early', type=float, default=2e-4)
+    parser.add_argument('--lr_late', type=float, default=2e-5)
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints')
-    parser.add_argument('--resume_epoch', type=int, default=40)
+    parser.add_argument('--resume_epoch', type=int, default=0)    # FIX: default 0
     parser.add_argument('--composed_attacks', action='store_true')
-
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Using device:", device)
-
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
-    # -------------------------------------------------
-    # MODELS
-    # -------------------------------------------------
     G = WatermarkGenerator(num_blocks=8).to(device)
     D = Discriminator().to(device)
-    D_secret = Discriminator().to(device)
 
-    # Resume BEFORE DataParallel
     start_epoch = 0
-    resume_path = os.path.join(
-        args.checkpoint_dir,
-        f"ckpt_epoch{args.resume_epoch}.pth"
-    )
+    if args.resume_epoch > 0:
+        resume_path = os.path.join(args.checkpoint_dir, f"ckpt_epoch{args.resume_epoch}.pth")
+        if os.path.exists(resume_path):
+            print("Loading checkpoint:", resume_path)
+            ckpt = torch.load(resume_path, map_location=device)
+            G.load_state_dict(ckpt["G"], strict=False)  # strict=False due to arch change
+            start_epoch = ckpt["epoch"]
+            print(f"Resumed from epoch {start_epoch}")
 
-    if os.path.exists(resume_path):
-        print("Loading checkpoint:", resume_path)
-        ckpt = torch.load(resume_path, map_location=device)
-
-        G.load_state_dict(ckpt["G"], strict=True)
-        start_epoch = ckpt["epoch"]
-
-        print(f"Resumed from epoch {start_epoch}")
-    else:
-        print("No checkpoint found. Starting fresh.")
-
-    # Multi GPU AFTER loading
     if torch.cuda.device_count() > 1:
         print("Using", torch.cuda.device_count(), "GPUs")
         G = nn.DataParallel(G)
         D = nn.DataParallel(D)
-        D_secret = nn.DataParallel(D_secret)
 
-    # LPIPS
     loss_fn_lpips = lpips.LPIPS(net='alex').to(device)
     loss_fn_lpips.eval()
 
-    # attacks
+    # FIX: identity layer weighted higher by appearing multiple times
     noise_list = [
+        Identity(), Identity(),  # 2x weight on clean
+        Gaussian_Noise(mean=0.0, sigma=5.0 / 127.5),
         Gaussian_Noise(mean=0.0, sigma=10.0 / 127.5),
         JpegCompression(device=device),
         Quantization(device=device),
-        CutoutAttack(drop_prob=0.15, block_size=48),
-        Identity()
+        CutoutAttack(drop_prob=0.10, block_size=32),
     ]
-
     attack_module = Noiser(noise_list, composed=args.composed_attacks).to(device)
+    identity_only = Noiser([Identity()]).to(device)
 
     mse = nn.MSELoss()
+    l1  = nn.L1Loss()
 
-    # optimizers
     opt_g = torch.optim.Adam(G.parameters(), lr=args.lr_early, betas=(0.5, 0.999))
     opt_d = torch.optim.Adam(D.parameters(), lr=args.lr_early, betas=(0.5, 0.999))
-    opt_ds = torch.optim.Adam(D_secret.parameters(), lr=args.lr_early, betas=(0.5, 0.999))
 
     gamma = args.lr_late / args.lr_early
-
     sch_g = MultiStepLR(opt_g, milestones=[args.phase3_epoch], gamma=gamma)
     sch_d = MultiStepLR(opt_d, milestones=[args.phase3_epoch], gamma=gamma)
-    sch_ds = MultiStepLR(opt_ds, milestones=[args.phase3_epoch], gamma=gamma)
 
-    # move scheduler to resumed epoch
     for _ in range(start_epoch):
         sch_g.step()
         if start_epoch >= args.phase2_epoch:
             sch_d.step()
-            sch_ds.step()
 
     scaler = GradScaler("cuda")
-
-    # loaders
-    cover_loader = get_loader(
-        "data/DIV2K/cover",
-        batch_size=args.batch_size,
-        shuffle=True
-    )
-
-    wm_loader = get_loader(
-        "data/DIV2K/watermark",
-        batch_size=args.batch_size,
-        shuffle=True
-    )
+    cover_loader = get_loader("data/DIV2K/cover",  batch_size=args.batch_size, shuffle=True)
+    wm_loader    = get_loader("data/DIV2K/watermark", batch_size=args.batch_size, shuffle=True)
 
     print("Starting Training...")
 
-    # -------------------------------------------------
-    # TRAIN LOOP
-    # -------------------------------------------------
     for epoch in range(start_epoch, args.epochs):
+        G.train(); D.train()
+        epoch_g = 0.0; epoch_d = 0.0
+        pc_total = 0.0; ps_total = 0.0; n = 0
 
-        G.train()
-        D.train()
-        D_secret.train()
+        # FIX: Curriculum learning - no attacks in Phase 1
+        if epoch < args.phase1_epoch:
+            current_attack = identity_only
+            lambda_secret = 2.0       # heavily emphasize secret first
+            lambda_cover  = 1.0
+        elif epoch < args.phase2_epoch:
+            current_attack = attack_module
+            lambda_secret = 1.5
+            lambda_cover  = 1.0
+        else:
+            current_attack = attack_module
+            lambda_secret = 1.0
+            lambda_cover  = 1.0
 
-        epoch_g = 0.0
-        epoch_d = 0.0
-        pc_total = 0.0
-        ps_total = 0.0
-        n = 0
-
-        pbar = tqdm(
-            zip(cover_loader, wm_loader),
-            total=min(len(cover_loader), len(wm_loader)),
-            desc=f"Epoch {epoch+1}/{args.epochs}"
-        )
+        pbar = tqdm(zip(cover_loader, wm_loader),
+                    total=min(len(cover_loader), len(wm_loader)),
+                    desc=f"Epoch {epoch+1}/{args.epochs}")
 
         for cover, wm in pbar:
-
-            if isinstance(cover, (list, tuple)):
-                cover = cover[0]
-
-            if isinstance(wm, (list, tuple)):
-                wm = wm[0]
+            if isinstance(cover, (list, tuple)): cover = cover[0]
+            if isinstance(wm, (list, tuple)):    wm = wm[0]
 
             cover = cover.to(device, non_blocking=True)
-            wm = wm.to(device, non_blocking=True)
+            wm    = wm.to(device, non_blocking=True)
 
-            # -------------------------------------------------
-            # GENERATOR STEP
-            # -------------------------------------------------
             opt_g.zero_grad(set_to_none=True)
 
             with autocast("cuda"):
+                
+                watermarked, z_latent = G(cover, wm)
 
-                watermarked = G(cover, wm)
-
-                attacked = attack_module(
-                    [watermarked.clone(), cover.clone()]
-                )[0]
-
+                attacked = current_attack([watermarked.clone(), cover.clone()])[0]
                 attacked = torch.clamp(attacked, -1, 1)
 
                 if isinstance(G, nn.DataParallel):
@@ -252,118 +182,70 @@ def main():
                 else:
                     extracted = G.extract(attacked, watermarked)
 
-                # losses
-                L_pre = mse(watermarked, cover)
-                L_post = mse(extracted, wm)
-                L_f = mse(watermarked, attacked)
-                L_dwt = dwt_loss(watermarked, cover)
-                L_lpips = safe_lpips(loss_fn_lpips, watermarked, cover, device)
+                L_cover_mse = mse(watermarked, cover)
+                L_cover_l1  = l1(watermarked, cover)
+                L_dwt       = dwt_loss(watermarked, cover)
+                L_lpips     = safe_lpips(loss_fn_lpips, watermarked, cover, device)
+                L_z         = torch.mean(z_latent ** 2)
 
-                g_loss = (
-                    L_pre +
-                    L_post +
-                    0.05 * L_f +
-                    1.0 * L_dwt +
-                    0.30 * L_lpips
-                )
+                L_secret_mse = mse(extracted, wm)
+                L_secret_l1  = l1(extracted, wm)
+
+                cover_loss  = (L_cover_mse + 0.5 * L_cover_l1 + 0.3 * L_dwt + 0.1 * L_lpips)
+                secret_loss = (L_secret_mse + 0.5 * L_secret_l1)
+
+                g_loss = lambda_cover * cover_loss + lambda_secret * secret_loss + 1.0 * L_z
 
                 if epoch >= args.phase2_epoch:
-                    d_fake_g = D(attacked.float())
-                    g_loss = g_loss + 0.03 * generator_adv_loss(d_fake_g)
-
+                    d_fake_g = D(watermarked.float())
+                    g_loss = g_loss + 0.01 * generator_adv_loss(d_fake_g)
             scaler.scale(g_loss).backward()
             scaler.unscale_(opt_g)
             torch.nn.utils.clip_grad_norm_(G.parameters(), 1.0)
             scaler.step(opt_g)
             scaler.update()
 
-            # -------------------------------------------------
-            # DISCRIMINATOR STEP
-            # -------------------------------------------------
             d_loss_val = 0.0
-
             if epoch >= args.phase2_epoch:
-
                 opt_d.zero_grad(set_to_none=True)
-
                 real_img = cover.detach().float()
-                fake_img = attacked.detach().float()
-
+                fake_img = watermarked.detach().float()
                 d_real = D(real_img)
                 d_fake = D(fake_img)
-
                 d_loss = discriminator_loss(d_real, d_fake)
-
                 d_loss.backward()
                 torch.nn.utils.clip_grad_norm_(D.parameters(), 1.0)
                 opt_d.step()
-
                 d_loss_val = d_loss.item()
 
-            # -------------------------------------------------
-            # METRICS
-            # -------------------------------------------------
             with torch.no_grad():
                 pc = psnr(watermarked.float(), cover.float(), mode='cover')
                 ps = psnr(extracted.float(), wm.float(), mode='secret')
 
-            epoch_g += g_loss.item()
-            epoch_d += d_loss_val
-            pc_total += pc
-            ps_total += ps
-            n += 1
+            epoch_g += g_loss.item(); epoch_d += d_loss_val
+            pc_total += pc; ps_total += ps; n += 1
 
-            pbar.set_postfix({
-                "G": f"{g_loss.item():.3f}",
-                "D": f"{d_loss_val:.3f}",
-                "PC": f"{pc:.1f}",
-                "PS": f"{ps:.1f}"
-            })
+            pbar.set_postfix({"G": f"{g_loss.item():.3f}", "D": f"{d_loss_val:.3f}",
+                              "PC": f"{pc:.1f}", "PS": f"{ps:.1f}"})
 
-        # scheduler AFTER optimizer step
         sch_g.step()
-
         if epoch >= args.phase2_epoch:
             sch_d.step()
-            sch_ds.step()
 
-        avg_g = epoch_g / n
-        avg_d = epoch_d / n
-        avg_pc = pc_total / n
-        avg_ps = ps_total / n
+        avg_pc = pc_total / n; avg_ps = ps_total / n
+        print(f"Epoch [{epoch+1}/{args.epochs}] "
+              f"G:{epoch_g/n:.4f} D:{epoch_d/n:.4f} "
+              f"PC:{avg_pc:.2f} PS:{avg_ps:.2f}")
 
-        print(
-            f"Epoch [{epoch+1}/{args.epochs}] "
-            f"G:{avg_g:.4f} "
-            f"D:{avg_d:.4f} "
-            f"PC:{avg_pc:.2f} "
-            f"PS:{avg_ps:.2f}"
-        )
-
-        # -------------------------------------------------
-        # SAVE CHECKPOINT
-        # -------------------------------------------------
         if (epoch + 1) % 10 == 0:
-
             save_G = G.module.state_dict() if isinstance(G, nn.DataParallel) else G.state_dict()
-
-            torch.save({
-                "epoch": epoch + 1,
-                "G": save_G,
-                "avg_psnr_c": avg_pc,
-                "avg_psnr_s": avg_ps
-            },
-            os.path.join(args.checkpoint_dir, f"ckpt_epoch{epoch+1}.pth"))
-
+            torch.save({"epoch": epoch + 1, "G": save_G,
+                        "avg_psnr_c": avg_pc, "avg_psnr_s": avg_ps},
+                       os.path.join(args.checkpoint_dir, f"ckpt_epoch{epoch+1}.pth"))
             print("Checkpoint saved.")
 
-    # -------------------------------------------------
-    # FINAL SAVE
-    # -------------------------------------------------
     save_G = G.module.state_dict() if isinstance(G, nn.DataParallel) else G.state_dict()
-
     torch.save(save_G, "generator_final.pth")
-
     print("Training Complete.")
 
 
