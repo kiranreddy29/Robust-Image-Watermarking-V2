@@ -171,34 +171,41 @@ def main():
             opt_g.zero_grad(set_to_none=True)
 
             with autocast("cuda"):
-                
                 watermarked, z_latent = G(cover, wm)
 
-                attacked = current_attack([watermarked.clone(), cover.clone()])[0]
-                attacked = torch.clamp(attacked, -1, 1)
+                # FIX: Don't clamp during training — use straight-through estimator
+                attacked = current_attack([watermarked, cover])[0]
+                # Straight-through clamp (identity gradient)
+                attacked_clamped = attacked.detach().clamp(-1, 1) + (attacked - attacked.detach())
 
                 if isinstance(G, nn.DataParallel):
-                    extracted = G.module.extract(attacked, watermarked)
+                    extracted = G.module.extract(attacked_clamped, watermarked)
                 else:
-                    extracted = G.extract(attacked, watermarked)
+                    extracted = G.extract(attacked_clamped, watermarked)
 
+                # Cover losses
                 L_cover_mse = mse(watermarked, cover)
                 L_cover_l1  = l1(watermarked, cover)
                 L_dwt       = dwt_loss(watermarked, cover)
                 L_lpips     = safe_lpips(loss_fn_lpips, watermarked, cover, device)
-                L_z         = torch.mean(z_latent ** 2)
 
+                # Secret losses
                 L_secret_mse = mse(extracted, wm)
                 L_secret_l1  = l1(extracted, wm)
 
-                cover_loss  = (L_cover_mse + 0.5 * L_cover_l1 + 0.3 * L_dwt + 0.1 * L_lpips)
-                secret_loss = (L_secret_mse + 0.5 * L_secret_l1)
+                # FIX: Weak z regularization (encourages but doesn't force z→0)
+                L_z = torch.mean(z_latent ** 2)
 
-                g_loss = lambda_cover * cover_loss + lambda_secret * secret_loss + 1.0 * L_z
+                cover_loss  = L_cover_mse + 0.5 * L_cover_l1 + 0.3 * L_dwt + 0.1 * L_lpips
+                secret_loss = L_secret_mse + 0.5 * L_secret_l1
+
+                # FIX: z weight reduced from 1.0 → 0.001
+                g_loss = lambda_cover * cover_loss + lambda_secret * secret_loss + 0.001 * L_z
 
                 if epoch >= args.phase2_epoch:
                     d_fake_g = D(watermarked.float())
-                    g_loss = g_loss + 0.01 * generator_adv_loss(d_fake_g)
+                    # FIX: bumped adv weight from 0.01 → 0.05
+                    g_loss = g_loss + 0.05 * generator_adv_loss(d_fake_g)
             scaler.scale(g_loss).backward()
             scaler.unscale_(opt_g)
             torch.nn.utils.clip_grad_norm_(G.parameters(), 1.0)

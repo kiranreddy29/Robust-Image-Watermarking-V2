@@ -51,7 +51,7 @@ def evaluate_attack(G, loader_cover, loader_wm, attack_module):
             wm = wm.to(device)
             
             # Embed
-            watermarked = G.embed(cover, wm)
+            watermarked, _ = G.embed(cover, wm)
             
             # Attack
             attacked = attack_module([watermarked, cover])[0]

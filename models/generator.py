@@ -151,34 +151,34 @@ class DifferentialFeatureExtractor(nn.Module):
 class WatermarkGenerator(nn.Module):
     def __init__(self, num_blocks=8):
         super().__init__()
-        # Removed TextureSaliency completely as the INN handles placement naturally
         self.isn_blocks   = nn.ModuleList([InvertibleBlock(in_channels=6) for _ in range(num_blocks)])
         self.enhance_pre  = EnhancementModule(channels=3, window_size=4)
         self.enhance_post = EnhancementModule(channels=3, window_size=8)
         self.diff_feat    = DifferentialFeatureExtractor(channels=3)
 
-    def forward(self, cover, secret):
-        """Used for TRAINING: Returns both the watermarked image and latent z"""
+    def embed(self, cover, secret):
+        """Embeds secret into cover via invertible flow."""
         x = torch.cat([cover, secret], dim=1)
         for block in self.isn_blocks:
             x = block(x, reverse=False)
-            
         watermarked = x[:, :3, :, :]
-        z = x[:, 3:, :, :] # <--- Capture the latent channels
+        z = x[:, 3:, :, :]   # latent (residual)
         return torch.clamp(watermarked, -1.0, 1.0), z
-
-    def embed(self, cover, secret):
-        """Used for TESTING/INFERENCE: Returns only the watermarked image"""
-        watermarked, _ = self.forward(cover, secret)
-        return watermarked
 
     def extract(self, attacked, watermarked):
         xc_feat     = self.diff_feat(watermarked, attacked)
         xd_enhanced = self.enhance_pre(attacked)
         x = torch.cat([xd_enhanced, xc_feat], dim=1)
-        
         for block in reversed(self.isn_blocks):
             x = block(x, reverse=True)
-            
         raw_secret = x[:, 3:, :, :]
         return torch.clamp(self.enhance_post(raw_secret), -1.0, 1.0)
+
+    def forward(self, cover, secret):
+        """For training: returns (watermarked, z)."""
+        return self.embed(cover, secret)
+
+    def embed_only(self, cover, secret):
+        """For inference: returns just the watermarked image."""
+        watermarked, _ = self.embed(cover, secret)
+        return watermarked

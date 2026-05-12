@@ -52,7 +52,7 @@ def main():
     secret_img = tf(Image.open(secret_path).convert('RGB')).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        watermarked = G(cover_img, secret_img)
+        watermarked = G.embed_only(cover_img, secret_img)
         extracted = G.extract(watermarked, watermarked)
 
     psnr_c = psnr(watermarked, cover_img, mode='cover')

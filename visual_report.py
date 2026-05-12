@@ -37,7 +37,7 @@ def main():
     }
 
     with torch.no_grad():
-        watermarked = G.embed(cover, secret)
+        watermarked, _ = G.embed(cover, secret)
 
         fig, axes = plt.subplots(4, len(attacks), figsize=(18, 12))
 
