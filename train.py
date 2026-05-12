@@ -133,8 +133,8 @@ def main():
             sch_d.step()
 
     scaler = GradScaler("cuda")
-    cover_loader = get_loader("data/DIV2K/cover",  batch_size=args.batch_size, shuffle=True)
-    wm_loader    = get_loader("data/DIV2K/watermark", batch_size=args.batch_size, shuffle=True)
+    cover_loader = get_loader("/kaggle/input/datasets/sharansmenon/div2k/DIV2K_train_HR/DIV2K_train_HR",  batch_size=args.batch_size, shuffle=True)
+    wm_loader    = get_loader("/kaggle/input/datasets/sharansmenon/div2k/DIV2K_valid_HR/DIV2K_valid_HR", batch_size=args.batch_size, shuffle=True)
 
     print("Starting Training...")
 
@@ -155,7 +155,7 @@ def main():
         else:
             current_attack = attack_module
             lambda_secret = 1.0
-            lambda_cover  = 1.0
+            lambda_cover  = 1.5
 
         pbar = tqdm(zip(cover_loader, wm_loader),
                     total=min(len(cover_loader), len(wm_loader)),
@@ -164,7 +164,7 @@ def main():
         for cover, wm in pbar:
             if isinstance(cover, (list, tuple)): cover = cover[0]
             if isinstance(wm, (list, tuple)):    wm = wm[0]
-
+            b_size = min(cover.size(0), wm.size(0))
             cover = cover.to(device, non_blocking=True)
             wm    = wm.to(device, non_blocking=True)
 
@@ -200,12 +200,12 @@ def main():
                 secret_loss = L_secret_mse + 0.5 * L_secret_l1
 
                 # FIX: z weight reduced from 1.0 → 0.001
-                g_loss = lambda_cover * cover_loss + lambda_secret * secret_loss + 0.001 * L_z
+                g_loss = lambda_cover * cover_loss + lambda_secret * secret_loss + 0.0001 * L_z
 
                 if epoch >= args.phase2_epoch:
                     d_fake_g = D(watermarked.float())
                     # FIX: bumped adv weight from 0.01 → 0.05
-                    g_loss = g_loss + 0.05 * generator_adv_loss(d_fake_g)
+                    g_loss = g_loss + 0.125 * generator_adv_loss(d_fake_g)
             scaler.scale(g_loss).backward()
             scaler.unscale_(opt_g)
             torch.nn.utils.clip_grad_norm_(G.parameters(), 1.0)
