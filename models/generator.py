@@ -149,12 +149,31 @@ class DifferentialFeatureExtractor(nn.Module):
         return self.final(torch.cat([diff, x1, x2, x3, x4],    dim=1))
 
 
+
+class LearnedDemodulation(nn.Module):
+    def __init__(self, channels=3):
+        super().__init__()
+        # Input: raw_secret (3 channels) + mask (1 channel) = 4 channels
+        self.net = nn.Sequential(
+            nn.Conv2d(channels + 1, 32, 3, padding=1),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(32, 32, 3, padding=1),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(32, channels, 3, padding=1)
+        )
+
+    def forward(self, secret, mask):
+        x = torch.cat([secret, mask], dim=1)
+        return self.net(x)
+
 class WatermarkGenerator(nn.Module):
+
     def __init__(self, num_blocks=8):
         super().__init__()
         
         # 1. Initialize your unique saliency feature
         self.saliency     = TextureSaliency() 
+        self.demodulator  = LearnedDemodulation(channels=3)
         
         self.isn_blocks   = nn.ModuleList([InvertibleBlock(in_channels=6) for _ in range(num_blocks)])
         self.enhance_pre  = EnhancementModule(channels=3, window_size=4)
@@ -186,10 +205,10 @@ class WatermarkGenerator(nn.Module):
             
         raw_secret = x[:, 3:, :, :]
         
-        # 3. EXACT DEMODULATION
-        # Recompute the mask from the watermarked image to perfectly reverse the modulation
+        # 3. LEARNED DEMODULATION
+        # Recompute the mask from the watermarked image to guide demodulation
         mask = self.saliency(watermarked).detach()
-        demodulated_secret = raw_secret / mask
+        demodulated_secret = self.demodulator(raw_secret, mask)
         
         return torch.clamp(self.enhance_post(demodulated_secret), -1.0, 1.0)
 

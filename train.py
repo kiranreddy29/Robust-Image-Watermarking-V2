@@ -13,7 +13,7 @@ from tqdm import tqdm
 from utils.metrics import psnr
 from noise_layers.cutout import CutoutAttack
 from models.generator import WatermarkGenerator
-from models.discriminator import Discriminator
+from models.discriminator import get_D1, get_D2
 from noise_layers.noiser import Noiser
 from noise_layers.Gaussian_noise import Gaussian_Noise
 from noise_layers.identity import Identity
@@ -38,11 +38,11 @@ def haar_dwt2d(x):
 
 
 def dwt_loss(x, y):
-    """FIX: Emphasize low-freq (visible) more, ignore high-freq mismatch."""
+    """Full Haar DWT Loss: MSE across high-frequency subbands."""
     llx, lhx, hlx, hhx = haar_dwt2d(x)
     lly, lhy, hly, hhy = haar_dwt2d(y)
-    return (F.l1_loss(llx, lly)
-            + 0.1 * (F.l1_loss(lhx, lhy) + F.l1_loss(hlx, hly) + F.l1_loss(hhx, hhy)))
+    # Task 3: MSE across all high-frequency subbands to mimic high-frequency noise
+    return F.mse_loss(lhx, lhy) + F.mse_loss(hlx, hly) + F.mse_loss(hhx, hhy)
 
 
 def discriminator_loss(real, fake):
@@ -68,11 +68,11 @@ def safe_lpips(loss_fn, a, b, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--epochs', type=int, default=160)
     parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--phase1_epoch', type=int, default=30)   # NEW: clean training
-    parser.add_argument('--phase2_epoch', type=int, default=80)   # adversarial
-    parser.add_argument('--phase3_epoch', type=int, default=160)  # LR drop
+    parser.add_argument('--phase1_epoch', type=int, default=15)   # NEW: clean training
+    parser.add_argument('--phase2_epoch', type=int, default=130)   # adversarial
+    parser.add_argument('--phase3_epoch', type=int, default=130)  # LR drop
     parser.add_argument('--lr_early', type=float, default=2e-4)
     parser.add_argument('--lr_late', type=float, default=2e-5)
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints')
@@ -85,7 +85,8 @@ def main():
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     G = WatermarkGenerator(num_blocks=8).to(device)
-    D = Discriminator().to(device)
+    D1 = get_D1().to(device)
+    D2 = get_D2().to(device)
 
     start_epoch = 0
     if args.resume_epoch > 0:
@@ -100,7 +101,8 @@ def main():
     if torch.cuda.device_count() > 1:
         print("Using", torch.cuda.device_count(), "GPUs")
         G = nn.DataParallel(G)
-        D = nn.DataParallel(D)
+        D1 = nn.DataParallel(D1)
+        D2 = nn.DataParallel(D2)
 
     loss_fn_lpips = lpips.LPIPS(net='alex').to(device)
     loss_fn_lpips.eval()
@@ -112,7 +114,7 @@ def main():
         Gaussian_Noise(mean=0.0, sigma=10.0 / 127.5),
         JpegCompression(device=device),
         Quantization(device=device),
-        CutoutAttack(drop_prob=0.10, block_size=32),
+        CutoutAttack(drop_prob=0.15),
     ]
     attack_module = Noiser(noise_list, composed=args.composed_attacks).to(device)
     identity_only = Noiser([Identity()]).to(device)
@@ -121,7 +123,7 @@ def main():
     l1  = nn.L1Loss()
 
     opt_g = torch.optim.Adam(G.parameters(), lr=args.lr_early, betas=(0.5, 0.999))
-    opt_d = torch.optim.Adam(D.parameters(), lr=args.lr_early, betas=(0.5, 0.999))
+    opt_d = torch.optim.Adam(list(D1.parameters()) + list(D2.parameters()), lr=args.lr_early, betas=(0.5, 0.999))
 
     gamma = args.lr_late / args.lr_early
     sch_g = MultiStepLR(opt_g, milestones=[args.phase3_epoch], gamma=gamma)
@@ -129,7 +131,7 @@ def main():
 
     for _ in range(start_epoch):
         sch_g.step()
-        if start_epoch >= args.phase2_epoch:
+        if start_epoch >= args.phase1_epoch:
             sch_d.step()
 
     scaler = GradScaler("cuda")
@@ -139,20 +141,23 @@ def main():
     print("Starting Training...")
 
     for epoch in range(start_epoch, args.epochs):
-        G.train(); D.train()
+        G.train(); D1.train(); D2.train()
         epoch_g = 0.0; epoch_d = 0.0
         pc_total = 0.0; ps_total = 0.0; n = 0
 
-        # FIX: Curriculum learning - no attacks in Phase 1
+        # Curriculum learning
         if epoch < args.phase1_epoch:
+            # Phase 1: Bijective training, Identity noise, no adversarial
             current_attack = identity_only
-            lambda_secret = 2.0       # heavily emphasize secret first
+            lambda_secret = 2.0
             lambda_cover  = 1.0
         elif epoch < args.phase2_epoch:
+            # Phase 2: D1/D2 active, attack active
             current_attack = attack_module
             lambda_secret = 1.5
             lambda_cover  = 1.0
         else:
+            # Phase 3: Fine tuning
             current_attack = attack_module
             lambda_secret = 1.0
             lambda_cover  = 1.5
@@ -196,16 +201,24 @@ def main():
                 # FIX: Weak z regularization (encourages but doesn't force z→0)
                 L_z = torch.mean(z_latent ** 2)
 
-                cover_loss  = L_cover_mse + 0.5 * L_cover_l1 + 0.3 * L_dwt + 0.1 * L_lpips
+                cover_loss  = L_cover_mse + 0.5 * L_cover_l1 + 0.3 * L_dwt + 0.3 * L_lpips
                 secret_loss = L_secret_mse + 0.5 * L_secret_l1
 
                 # FIX: z weight reduced from 1.0 → 0.001
                 g_loss = lambda_cover * cover_loss + lambda_secret * secret_loss + 0.0001 * L_z
 
-                if epoch >= args.phase2_epoch:
-                    d_fake_g = D(watermarked.float())
-                    # FIX: bumped adv weight from 0.01 → 0.05
-                    g_loss = g_loss + 0.125 * generator_adv_loss(d_fake_g)
+                if epoch >= args.phase1_epoch:  # Phase 2 starts at phase1_epoch
+                    # Adversarial loss incorporating both D1 and D2
+                    d1_fake_g = D1(watermarked.float())
+
+                    # D2 expects watermarked image concatenated with its saliency map
+                    mask_w = G.module.saliency(watermarked).detach() if isinstance(G, nn.DataParallel) else G.saliency(watermarked).detach()
+                    d2_input = torch.cat([watermarked.float(), mask_w], dim=1)
+                    d2_fake_g = D2(d2_input)
+
+                    lambda_d = 1.0
+                    l_adv = generator_adv_loss(d1_fake_g) + lambda_d * generator_adv_loss(d2_fake_g)
+                    g_loss = g_loss + l_adv
             scaler.scale(g_loss).backward()
             scaler.unscale_(opt_g)
             torch.nn.utils.clip_grad_norm_(G.parameters(), 1.0)
@@ -213,15 +226,30 @@ def main():
             scaler.update()
 
             d_loss_val = 0.0
-            if epoch >= args.phase2_epoch:
+            if epoch >= args.phase1_epoch:
                 opt_d.zero_grad(set_to_none=True)
                 real_img = cover.detach().float()
                 fake_img = watermarked.detach().float()
-                d_real = D(real_img)
-                d_fake = D(fake_img)
-                d_loss = discriminator_loss(d_real, d_fake)
+
+                # D1 Update
+                d1_real = D1(real_img)
+                d1_fake = D1(fake_img)
+                d1_loss = discriminator_loss(d1_real, d1_fake)
+
+                # D2 Update
+                mask_real = G.module.saliency(real_img).detach() if isinstance(G, nn.DataParallel) else G.saliency(real_img).detach()
+                mask_fake = G.module.saliency(fake_img).detach() if isinstance(G, nn.DataParallel) else G.saliency(fake_img).detach()
+
+                d2_real_input = torch.cat([real_img, mask_real], dim=1)
+                d2_fake_input = torch.cat([fake_img, mask_fake], dim=1)
+
+                d2_real = D2(d2_real_input)
+                d2_fake = D2(d2_fake_input)
+                d2_loss = discriminator_loss(d2_real, d2_fake)
+
+                d_loss = d1_loss + d2_loss
                 d_loss.backward()
-                torch.nn.utils.clip_grad_norm_(D.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(list(D1.parameters()) + list(D2.parameters()), 1.0)
                 opt_d.step()
                 d_loss_val = d_loss.item()
 
@@ -236,7 +264,7 @@ def main():
                               "PC": f"{pc:.1f}", "PS": f"{ps:.1f}"})
 
         sch_g.step()
-        if epoch >= args.phase2_epoch:
+        if epoch >= args.phase1_epoch:
             sch_d.step()
 
         avg_pc = pc_total / n; avg_ps = ps_total / n
